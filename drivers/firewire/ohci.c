@@ -264,6 +264,8 @@ static char ohci_driver_name[] = KBUILD_MODNAME;
 #define PCI_DEVICE_ID_AGERE_FW643	0x5901
 #define PCI_DEVICE_ID_CREATIVE_SB1394	0x4001
 #define PCI_DEVICE_ID_JMICRON_JMB38X_FW	0x2380
+#define PCI_DEVICE_ID_RICOH_R5C832	0x0832
+#define PCI_DEVICE_ID_RICOH_R5C832_E	0xe832
 #define PCI_DEVICE_ID_TI_TSB12LV22	0x8009
 #define PCI_DEVICE_ID_TI_TSB12LV26	0x8020
 #define PCI_DEVICE_ID_TI_TSB82AA2	0x8025
@@ -278,6 +280,7 @@ static char ohci_driver_name[] = KBUILD_MODNAME;
 #define QUIRK_NO_MSI			0x10
 #define QUIRK_TI_SLLZ059		0x20
 #define QUIRK_IR_WAKE			0x40
+#define QUIRK_RICOH_FIFO_SIZE		0x80
 
 /* In case of multiple matches in ohci_quirks[], only the first one is used. */
 static const struct {
@@ -303,6 +306,12 @@ static const struct {
 
 	{PCI_VENDOR_ID_O2, PCI_ANY_ID, PCI_ANY_ID,
 		QUIRK_NO_MSI},
+
+	{PCI_VENDOR_ID_RICOH, PCI_DEVICE_ID_RICOH_R5C832, PCI_ANY_ID,
+		QUIRK_CYCLE_TIMER | QUIRK_RICOH_FIFO_SIZE},
+
+	{PCI_VENDOR_ID_RICOH, PCI_DEVICE_ID_RICOH_R5C832_E, PCI_ANY_ID,
+		QUIRK_CYCLE_TIMER | QUIRK_NO_MSI | QUIRK_RICOH_FIFO_SIZE},
 
 	{PCI_VENDOR_ID_RICOH, PCI_ANY_ID, PCI_ANY_ID,
 		QUIRK_CYCLE_TIMER | QUIRK_NO_MSI},
@@ -343,7 +352,13 @@ MODULE_PARM_DESC(quirks, "Chip quirks (default = 0"
 	", disable MSI = "		__stringify(QUIRK_NO_MSI)
 	", TI SLLZ059 erratum = "	__stringify(QUIRK_TI_SLLZ059)
 	", IR wake unreliable = "	__stringify(QUIRK_IR_WAKE)
+	", Ricoh FIFO configurable = "	__stringify(QUIRK_RICOH_FIFO_SIZE)
 	")");
+
+static bool param_ricoh_audio;
+module_param_named(ricoh_audio, param_ricoh_audio, bool, 0444);
+MODULE_PARM_DESC(ricoh_audio,
+	"Prioritize audio over disk traffic on Ricoh controllers");
 
 #define OHCI_PARAM_DEBUG_AT_AR		1
 #define OHCI_PARAM_DEBUG_SELFIDS	2
@@ -2258,6 +2273,40 @@ static int probe_tsb41ba3d(struct fw_ohci *ohci)
 	return 1;
 }
 
+static void configure_ricoh_fifo(struct fw_ohci *ohci)
+{
+	struct pci_dev *dev = to_pci_dev(ohci->card.device);
+	int where;
+	u32 val;
+
+	switch (dev->device) {
+	case PCI_DEVICE_ID_RICOH_R5C832:
+		where = 0x88;
+		break;
+	case PCI_DEVICE_ID_RICOH_R5C832_E:
+		where = 0xe8;
+		break;
+	default:
+		return;
+	}
+
+	/* undocumented magic */
+	pci_read_config_dword(dev, where, &val);
+	val &= ~(0xff << 24);
+	if (param_ricoh_audio)
+		val |= 0x20 << 24;
+	pci_write_config_dword(dev, where, val);
+
+	/* adjust the max_rec field */
+	val = reg_read(ohci, OHCI1394_BusOptions);
+	val &= ~(0xf << 12);
+	if (param_ricoh_audio)
+		val |= 0x8 << 12; /* 512 bytes */
+	else
+		val |= 0xa << 12; /* 2048 bytes */
+	reg_write(ohci, OHCI1394_BusOptions, val);
+}
+
 static int ohci_enable(struct fw_card *card,
 		       const __be32 *config_rom, size_t length)
 {
@@ -2309,6 +2358,9 @@ static int ohci_enable(struct fw_card *card,
 		else
 			ohci->quirks &= ~QUIRK_TI_SLLZ059;
 	}
+
+	if (ohci->quirks & QUIRK_RICOH_FIFO_SIZE)
+		configure_ricoh_fifo(ohci);
 
 	reg_write(ohci, OHCI1394_HCControlClear,
 		  OHCI1394_HCControl_noByteSwapData);
